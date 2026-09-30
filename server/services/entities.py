@@ -143,6 +143,7 @@ async def populate_entities_for_memories(
 
     # ── Step 3: batch embed ─────────────────────────────────────────────
     provider = get_embedding_provider()
+    current_model = provider.model if provider is not None else None
     embeddings_by_normalized: dict[str, list[float] | None] = {
         normalized: None for normalized in distinct_texts
     }
@@ -187,6 +188,7 @@ async def populate_entities_for_memories(
                     entity_normalized=e.normalized,
                     entity_kind=e.kind,
                     embedding=embedding,
+                    embedding_model=current_model if embedding is not None else None,
                     memory_id=memory_id,
                 )
                 touched += 1

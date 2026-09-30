@@ -27,6 +27,7 @@ from server.db.tables import (
     SupersessionRecordRow,
     TenantConfigRow,
 )
+from server.services.embeddings import same_embedding_model
 
 
 def _unexpired(stmt):
@@ -706,6 +707,26 @@ async def _append_entity_link_atomic(
     await session.refresh(row)
 
 
+# How many nearest-by-distance candidates upsert_entity_with_link tries
+# before giving up on a semantic merge (#460): enough to look past a
+# cross-model candidate to find a same-model one.
+_SEMANTIC_DEDUP_CANDIDATE_LIMIT = 5
+
+
+def _entity_embeddings_are_comparable(a: str | None, b: str | None) -> bool:
+    """True iff a cosine distance between embeddings tagged `a` and `b` is
+    safe to trust for entity dedup (#460).
+
+    NULL means unknown provenance (a legacy row, or a caller that did not
+    pass embedding_model) and is treated as comparable, the same convention
+    MemoryRow.embedding_model uses for the read-side mismatch check: only a
+    KNOWN pair of different models is refused.
+    """
+    if a is None or b is None:
+        return True
+    return same_embedding_model(a, b)
+
+
 async def upsert_entity_with_link(
     session: AsyncSession,
     *,
@@ -716,6 +737,7 @@ async def upsert_entity_with_link(
     entity_kind: str | None,
     embedding: list[float] | None,
     memory_id: uuid.UUID,
+    embedding_model: str | None = None,
     dedup_cosine_threshold: float = 0.95,
 ) -> SubjectEntityRow:
     """Insert or merge an entity row for (subject_id, normalized text /
@@ -725,8 +747,14 @@ async def upsert_entity_with_link(
       1. Exact match on (subject_id, entity_normalized) — cheapest.
          If found, append memory_id and return.
       2. If miss AND embedding provided, cosine-distance probe against
-         all entities for the same subject; merge if any row is within
-         `dedup_cosine_threshold` (default 0.95).
+         entities for the same subject; merge with the nearest row
+         within `dedup_cosine_threshold` (default 0.95) WHOSE embedding
+         is comparable to this one (#460): a candidate is skipped, not
+         merged, when both sides name a known `embedding_model` and the
+         models differ, since a cosine distance across two unrelated
+         embedding spaces carries no defined meaning. A NULL model on
+         either side (unknown provenance) is treated as comparable,
+         matching MemoryRow.embedding_model's convention.
       3. Otherwise insert a new row with [memory_id] as the initial
          linkage.
 
@@ -752,7 +780,9 @@ async def upsert_entity_with_link(
         await _append_entity_link_atomic(session, exact, memory_id)
         return exact
 
-    # Step 2: semantic dedup (only if we have an embedding to compare with)
+    # Step 2: semantic dedup. Pull a few nearest candidates (#460), not just
+    # the closest one: the nearest row can be a cross-model candidate we must
+    # skip, while a same-model duplicate within threshold sits just behind it.
     if embedding is not None:
         distance_expr = SubjectEntityRow.embedding.cosine_distance(embedding)
         near_stmt = (
@@ -762,14 +792,18 @@ async def upsert_entity_with_link(
         )
         if tenant_id is not None:
             near_stmt = near_stmt.where(SubjectEntityRow.tenant_id == tenant_id)
-        near_stmt = near_stmt.order_by(distance_expr).limit(1)
-        near_row = (await session.execute(near_stmt)).first()
-        if near_row is not None:
-            existing_row, distance = near_row
+        near_stmt = near_stmt.order_by(distance_expr).limit(_SEMANTIC_DEDUP_CANDIDATE_LIMIT)
+        near_rows = (await session.execute(near_stmt)).all()
+        for existing_row, distance in near_rows:
             # Cosine distance ≤ (1 - threshold) ⇒ similarity ≥ threshold.
-            if float(distance) <= (1.0 - dedup_cosine_threshold):
-                await _append_entity_link_atomic(session, existing_row, memory_id)
-                return existing_row
+            # Rows are ordered by ascending distance, so once one candidate
+            # falls outside the threshold, every remaining one does too.
+            if float(distance) > (1.0 - dedup_cosine_threshold):
+                break
+            if not _entity_embeddings_are_comparable(existing_row.embedding_model, embedding_model):
+                continue
+            await _append_entity_link_atomic(session, existing_row, memory_id)
+            return existing_row
 
     # Step 3: insert fresh — via ON CONFLICT against the unique identity
     # index (migration 0030), so a CONCURRENT writer that inserted the same
@@ -788,6 +822,7 @@ async def upsert_entity_with_link(
         entity_normalized=entity_normalized,
         entity_kind=entity_kind,
         embedding=embedding,
+        embedding_model=embedding_model,
         linked_memory_ids=[memory_id],
     )
     mid = literal(memory_id, type_=SubjectEntityRow.id.type)
@@ -806,6 +841,9 @@ async def upsert_entity_with_link(
                 else_=func.array_append(SubjectEntityRow.linked_memory_ids, mid),
             ),
             "embedding": func.coalesce(SubjectEntityRow.embedding, stmt.excluded.embedding),
+            "embedding_model": func.coalesce(
+                SubjectEntityRow.embedding_model, stmt.excluded.embedding_model
+            ),
             "updated_at": func.now(),
         },
     ).returning(SubjectEntityRow.id)

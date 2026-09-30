@@ -109,7 +109,7 @@ class TestMigrationStatus:
 def test_get_all_revisions():
     """Verify we can introspect the migration chain."""
     revs = get_all_revisions()
-    assert len(revs) == 32
+    assert len(revs) == 33
     assert revs[0] == "0001"
     assert revs[-1] == EXPECTED_HEAD
 
@@ -136,7 +136,7 @@ def test_resolve_pending_behind():
     status = MigrationStatus(current_revision="0010")
     result = _resolve_pending(status)
     assert not result.is_compatible
-    assert result.pending_count == 22
+    assert result.pending_count == 23
     assert "0011" in result.pending_revisions
     assert EXPECTED_HEAD in result.pending_revisions
 
@@ -145,7 +145,7 @@ def test_resolve_pending_fresh_db():
     """When current is None, all revisions are pending."""
     status = MigrationStatus(current_revision=None)
     result = _resolve_pending(status)
-    assert result.pending_count == 32
+    assert result.pending_count == 33
 
 
 def test_resolve_pending_unknown_revision():

@@ -184,6 +184,10 @@ class SubjectEntityRow(Base):
     embedding: Mapped[list[float] | None] = mapped_column(
         Vector(EMBEDDING_DIMENSIONS), nullable=True
     )
+    # Model that produced `embedding` (#460), mirroring MemoryRow.embedding_model:
+    # lets upsert_entity_with_link refuse a cosine distance computed across two
+    # different embedding spaces. NULL = unknown provenance, never a mismatch.
+    embedding_model: Mapped[str | None] = mapped_column(Text, nullable=True)
     linked_memory_ids: Mapped[list[uuid.UUID]] = mapped_column(
         ARRAY(UUID(as_uuid=True)), nullable=False, default=list
     )

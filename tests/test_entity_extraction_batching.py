@@ -151,6 +151,90 @@ async def test_populate_groups_by_batch_size(monkeypatch):
     assert sorted(group_sizes, reverse=True) == [10, 10, 5]
 
 
+async def test_populate_stamps_the_current_embedding_model(monkeypatch):
+    """populate_entities_for_memories must tell upsert_entity_with_link which
+    model produced the vector it hands over (#460), so the dedup merge
+    decision downstream can tell two embedding spaces apart. A row that got
+    no vector (extraction produced one, embedding failed/skipped) must not
+    get a model stamp either: there's nothing for it to describe."""
+    from server.services import entities as ent
+    import server.db.repositories as repo_module
+
+    memory = ent.MemoryForEntities(id=uuid.uuid4(), content="Grace Hopper works at IBM.")
+
+    async def fake_batch(texts):
+        return [
+            [ent.ExtractedEntity(text="Grace Hopper", normalized="grace hopper", kind="PERSON")]
+            for _ in texts
+        ]
+
+    class _FakeProvider:
+        model = "text-embedding-3-small"
+
+        async def embed_texts(self, texts):
+            return [[0.1] * 1536 for _ in texts]
+
+    calls = []
+
+    async def fake_upsert(_session, **kwargs):
+        calls.append(kwargs)
+
+        class _Row:
+            id = uuid.uuid4()
+
+        return _Row()
+
+    monkeypatch.setattr(ent, "extract_entities_batch", fake_batch)
+    monkeypatch.setattr(ent, "get_embedding_provider", lambda: _FakeProvider())
+    monkeypatch.setattr(repo_module, "upsert_entity_with_link", fake_upsert)
+
+    await ent.populate_entities_for_memories(
+        AsyncMock(), [memory], subject_id="subj", tenant_id=None
+    )
+
+    assert len(calls) == 1
+    assert calls[0]["embedding"] == [0.1] * 1536
+    assert calls[0]["embedding_model"] == "text-embedding-3-small"
+
+
+async def test_populate_does_not_stamp_a_model_without_a_vector(monkeypatch):
+    """When the provider is disabled (embedding stays None), no model id
+    should be attached either: a model tag with no vector describes
+    nothing and would poison a future comparison."""
+    from server.services import entities as ent
+    import server.db.repositories as repo_module
+
+    memory = ent.MemoryForEntities(id=uuid.uuid4(), content="Grace Hopper works at IBM.")
+
+    async def fake_batch(texts):
+        return [
+            [ent.ExtractedEntity(text="Grace Hopper", normalized="grace hopper", kind="PERSON")]
+            for _ in texts
+        ]
+
+    calls = []
+
+    async def fake_upsert(_session, **kwargs):
+        calls.append(kwargs)
+
+        class _Row:
+            id = uuid.uuid4()
+
+        return _Row()
+
+    monkeypatch.setattr(ent, "extract_entities_batch", fake_batch)
+    monkeypatch.setattr(ent, "get_embedding_provider", lambda: None)
+    monkeypatch.setattr(repo_module, "upsert_entity_with_link", fake_upsert)
+
+    await ent.populate_entities_for_memories(
+        AsyncMock(), [memory], subject_id="subj", tenant_id=None
+    )
+
+    assert len(calls) == 1
+    assert calls[0]["embedding"] is None
+    assert calls[0]["embedding_model"] is None
+
+
 # ---------------------------------------------------------------------------
 # rebuild-entities endpoint (deliberately separate from /admin/import: an
 # inline rebuild made the import outlive client timeouts, and a retried
