@@ -75,62 +75,15 @@ _BACKFILL_BATCH_SIZE = 5000
 
 
 def _configured_embedding_model(bind) -> str | None:
-    """Best-effort resolution of the model presently producing embeddings.
+    """Resolve the model presently producing embeddings.
 
-    Mirrors the precedence `server.core.dynamic_settings.get_setting()`
-    documents (tenant_override -> global_db -> env -> hardcoded default),
-    minus the tenant step: `server.services.embeddings.get_provider()`
-    builds one process-wide singleton from global config only and never
-    consults a tenant override, so a tenant-scoped `litellm_embedding_model`
-    row isn't the model actually stamping fresh vectors either; mirroring
-    tenant precedence here would claim a precision the running server
-    doesn't have.
-
-    Reads `system_settings` (the admin-UI override layer, #26) directly so
-    an operator-configured deployment backfills the value actually set
-    there, then falls back to `server.core.config.settings`, which loads
-    `.env` itself, unlike a raw `os.environ` read, for the env/.env step.
-    `alembic/env.py` already imports `server.db.tables` and
-    `server.services.migrations`, so importing `server.core.config` here
-    is the same thing this chain already does elsewhere.
-
-    A deployment topology that hands this migration's process a narrower
-    env than the application itself sees (e.g. a Helm migration Job given
-    only `STATEWAVE_DATABASE_URL`) and has never written a `system_settings`
-    override either is a chart-wiring gap outside what any in-process read
-    can recover. The "none"/unrecognized branch below leaves the column
-    NULL rather than guessing in that case.
+    Lives in `server.services.migrations` so migration 0033 resolves it the
+    same way; `alembic/env.py` already imports from `server`, so this adds no
+    new coupling.
     """
-    from sqlalchemy import select
+    from server.services.migrations import configured_embedding_model
 
-    from server.core.config import settings as env_settings
-    from server.core.dynamic_settings import system_settings
-
-    overrides: dict[str, object] = {}
-    try:
-        # Selecting through the real `system_settings` Table (rather than a
-        # hand-typed `sa.text` SELECT) makes SQLAlchemy apply the JSONB
-        # column's own result decoding, so this reads the same Python value
-        # `apply_global_override` wrote, independent of what the driver
-        # returns for a raw-text query.
-        result = bind.execute(
-            select(system_settings.c.key, system_settings.c.value).where(
-                system_settings.c.key.in_(("embedding_provider", "litellm_embedding_model"))
-            )
-        )
-        overrides = dict(result.fetchall())
-    except Exception:
-        # `system_settings` is created by migration 0026, strictly earlier
-        # in this chain, so this is defensive (e.g. an offline `--sql`
-        # render with no live connection) rather than an expected path.
-        overrides = {}
-
-    provider = overrides.get("embedding_provider", env_settings.embedding_provider)
-    if provider == "litellm":
-        return overrides.get("litellm_embedding_model", env_settings.litellm_embedding_model)
-    if provider == "stub":
-        return "stub"
-    return None  # "none" (or unrecognized): no live provider to attribute rows to
+    return configured_embedding_model(bind)
 
 
 def upgrade() -> None:

@@ -247,3 +247,33 @@ async def test_conflict_path_keeps_first_non_null_embedding_model(session_factor
     rows = await _rows_for(session_factory, subject_id)
     assert len(rows) == 1
     assert rows[0].embedding_model == "model-a"
+
+
+async def test_provider_prefix_is_not_treated_as_a_different_model(session_factory):
+    """`openai/text-embedding-3-small` and `text-embedding-3-small` are the
+    same model, so a row tagged with one must still merge with the other.
+
+    The guard normalizes rather than comparing raw strings, but nothing at
+    this level pinned that: with a bare `!=` the two ids below look
+    different and a real duplicate would be inserted instead of merged.
+    """
+    subject_id = f"emb-model-{uuid.uuid4().hex[:8]}"
+    await _upsert(
+        session_factory,
+        subject_id=subject_id,
+        text="Grace Hopper",
+        embedding=_V,
+        embedding_model="openai/text-embedding-3-small",
+        memory_id=uuid.uuid4(),
+    )
+    await _upsert(
+        session_factory,
+        subject_id=subject_id,
+        text="G. Hopper",
+        embedding=_V,
+        embedding_model="text-embedding-3-small",
+        memory_id=uuid.uuid4(),
+    )
+
+    rows = await _rows_for(session_factory, subject_id)
+    assert len(rows) == 1, "the same model under a provider prefix must still merge"

@@ -841,8 +841,17 @@ async def upsert_entity_with_link(
                 else_=func.array_append(SubjectEntityRow.linked_memory_ids, mid),
             ),
             "embedding": func.coalesce(SubjectEntityRow.embedding, stmt.excluded.embedding),
-            "embedding_model": func.coalesce(
-                SubjectEntityRow.embedding_model, stmt.excluded.embedding_model
+            # The vector and the model that produced it move together. Coalescing
+            # them independently lets a row keep its own vector while taking the
+            # incoming writer's model id, so it ends up claiming a model it did
+            # not come from. That is worse than NULL, because NULL is treated as
+            # unknown and exempt while a wrong id is trusted by the dedup guard.
+            "embedding_model": case(
+                (
+                    SubjectEntityRow.embedding.is_(None),
+                    stmt.excluded.embedding_model,
+                ),
+                else_=SubjectEntityRow.embedding_model,
             ),
             "updated_at": func.now(),
         },
