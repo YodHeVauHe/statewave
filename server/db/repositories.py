@@ -849,7 +849,7 @@ async def upsert_entity_with_link(
             "embedding_model": case(
                 (
                     SubjectEntityRow.embedding.is_(None),
-                    stmt.excluded.embedding_model,
+                    func.coalesce(SubjectEntityRow.embedding_model, stmt.excluded.embedding_model),
                 ),
                 else_=SubjectEntityRow.embedding_model,
             ),
