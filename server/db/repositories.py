@@ -674,7 +674,12 @@ async def search_memories_hybrid(
 
 
 async def _append_entity_link_atomic(
-    session: AsyncSession, row: SubjectEntityRow, memory_id: uuid.UUID
+    session: AsyncSession,
+    row: SubjectEntityRow,
+    memory_id: uuid.UUID,
+    *,
+    embedding: list[float] | None = None,
+    embedding_model: str | None = None,
 ) -> None:
     """Append memory_id to a row's linked_memory_ids as ONE guarded SQL
     UPDATE, never an ORM read-modify-write. Two concurrent appenders that
@@ -684,10 +689,22 @@ async def _append_entity_link_atomic(
     lock and re-evaluates the append against the latest committed array,
     so concurrent appends serialize; the ANY() guard keeps repeated
     linkage of the same memory a no-op.
+
+    Also folds in the caller's embedding/embedding_model, with the same
+    coalesce-together rule the ON CONFLICT branch below uses: a row with
+    no embedding yet adopts the incoming one (and its model), a row that
+    already has an embedding keeps both. Without this, a concurrent writer
+    that resolves here (an exact-text match already committed by the other
+    side, #460) links its memory_id and silently drops the model it
+    carried.
     """
     from sqlalchemy import any_, case, literal
 
     mid = literal(memory_id, type_=SubjectEntityRow.id.type)
+    # pgvector's codec needs the column's own type on the bind parameter;
+    # an untyped list literal lands on asyncpg's default text codec and
+    # raises "TypeError: expected str, got list" at execute time.
+    new_embedding = literal(embedding, type_=SubjectEntityRow.embedding.type)
     await session.execute(
         update(SubjectEntityRow)
         .where(SubjectEntityRow.id == row.id)
@@ -698,6 +715,14 @@ async def _append_entity_link_atomic(
                     SubjectEntityRow.linked_memory_ids,
                 ),
                 else_=func.array_append(SubjectEntityRow.linked_memory_ids, mid),
+            ),
+            embedding=func.coalesce(SubjectEntityRow.embedding, new_embedding),
+            embedding_model=case(
+                (
+                    SubjectEntityRow.embedding.is_(None),
+                    func.coalesce(SubjectEntityRow.embedding_model, embedding_model),
+                ),
+                else_=SubjectEntityRow.embedding_model,
             ),
             updated_at=func.now(),
         )
@@ -777,7 +802,9 @@ async def upsert_entity_with_link(
         exact_stmt = exact_stmt.where(SubjectEntityRow.tenant_id == tenant_id)
     exact = (await session.execute(exact_stmt)).scalar_one_or_none()
     if exact is not None:
-        await _append_entity_link_atomic(session, exact, memory_id)
+        await _append_entity_link_atomic(
+            session, exact, memory_id, embedding=embedding, embedding_model=embedding_model
+        )
         return exact
 
     # Step 2: semantic dedup. Pull a few nearest candidates (#460), not just
@@ -802,7 +829,13 @@ async def upsert_entity_with_link(
                 break
             if not _entity_embeddings_are_comparable(existing_row.embedding_model, embedding_model):
                 continue
-            await _append_entity_link_atomic(session, existing_row, memory_id)
+            await _append_entity_link_atomic(
+                session,
+                existing_row,
+                memory_id,
+                embedding=embedding,
+                embedding_model=embedding_model,
+            )
             return existing_row
 
     # Step 3: insert fresh — via ON CONFLICT against the unique identity
